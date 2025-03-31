@@ -1,4 +1,4 @@
-# T-Display-S3 Nyancat Clock
+# T-Display-S3 NyanCat Clock
 
 An animated clock for the LilyGO T-Display-S3 featuring:
 - Nyan Cat animation
