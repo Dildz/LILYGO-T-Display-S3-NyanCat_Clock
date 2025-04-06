@@ -1,4 +1,8 @@
-// Include necessary libraries
+/*************************************************************
+******************* INCLUDES & DEFINITIONS *******************
+**************************************************************/
+
+// Necessary libraries
 #include <Arduino.h>  // core Arduino library
 #include <TFT_eSPI.h> // for TFT display control
 #include <WiFi.h>     // for WiFi connectivity
@@ -26,8 +30,8 @@ TFT_eSprite fpsSprite = TFT_eSprite(&lcd);
 TFT_eSprite calendarSprite = TFT_eSprite(&lcd);
 
 // WiFi credentials - replace with your network info
-const char* wifiNetwork = "TP-LINK 2.5GHz"; // change to your SSID name
-const char* wifiPassword = "Uitenhage1";    // change to your password
+const char* wifiNetwork = "YOUR_SSID"; // change to your SSID name
+const char* wifiPassword = "YOUR_PASSWORD"; // change to your password
 String ipAddress; // string to store the assigned IP address
 
 /* 
@@ -96,6 +100,10 @@ uint8_t wifiState = WIFI_DISCONNECTED;
 unsigned long lastWifiCheck = 0;
 uint16_t wifiColour = TFT_GREEN;
 
+
+/*************************************************************
+********************** HELPER FUNCTIONS **********************
+**************************************************************/
 
 // Function to update time from NTP server
 void updateCurrentTime(bool forceNTPSync = false) {
@@ -234,6 +242,10 @@ void adjustBrightness() {
   prevKeyBtn = currKeyBtn;
 }
 
+
+/*************************************************************
+*********************** MAIN FUNCTIONS ***********************
+**************************************************************/
 
 // SETUP FUNCTION - runs once at startup
 void setup(void) {
