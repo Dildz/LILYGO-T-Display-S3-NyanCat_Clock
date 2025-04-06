@@ -6,8 +6,8 @@
 #include "nyancat.h"  // custom header for animation frames
 
 // Button pins - using GPIO pins connected to physical buttons
-int leftButtonPin = 0;   // GPIO0 for left button (used to decrease brightness)
-int rightButtonPin = 14; // GPIO14 for right button (used to increase brightness)
+int BootButton = 0; // GPIO0 for left button (used to decrease brightness)
+int KeyButton = 14; // GPIO14 for right button (used to increase brightness)
 
 /* 
 Create display and sprite objects:
@@ -15,18 +15,20 @@ Create display and sprite objects:
  - mainSprite: Primary drawing surface
  - secondsSprite: For displaying seconds separately
  - infoSprite: For FPS and connection info
+ - fpsSprite: For second FPS counter (bottom left)
  - calendarSprite: For date/timezone header
 */
 TFT_eSPI lcd = TFT_eSPI();
 TFT_eSprite mainSprite = TFT_eSprite(&lcd);
 TFT_eSprite secondsSprite = TFT_eSprite(&lcd);
 TFT_eSprite infoSprite = TFT_eSprite(&lcd);
+TFT_eSprite fpsSprite = TFT_eSprite(&lcd);
 TFT_eSprite calendarSprite = TFT_eSprite(&lcd);
 
 // WiFi credentials - replace with your network info
-const char* wifiNetwork = "TP-LINK 2.5GHz";
-const char* wifiPassword = "Uitenhage1";
-String ipAddress; // to store device's assigned IP address
+const char* wifiNetwork = "TP-LINK 2.5GHz"; // change to your SSID name
+const char* wifiPassword = "Uitenhage1";    // change to your password
+String ipAddress; // string to store the assigned IP address
 
 /* 
 Time configuration:
@@ -41,7 +43,7 @@ long timeZoneOffset;     // calculated timezone offset
 int daylightSavingsOffset = 3600; // DST offset in seconds (1 hour)
 String timezoneString = "SAST";   // timezone abbreviation, change to your timezone code
 
-// Custom color definition (16-bit RGB color)
+// Custom colour definition (16-bit RGB colour)
 #define PURPLE_COLOUR 0x604D
 
 // Time component buffers (strings to hold formatted time)
@@ -53,6 +55,12 @@ char currentMonth[6];  // Month abbreviation (3 letters)
 char currentYear[5];   // YYYY
 char weekdayName[10];  // full weekday name
 String weekdayString;  // weekday as String object
+String lastWeekday;    // cached weekday string
+
+// Time tracking variables
+unsigned long lastMillis = 0, elapsedSeconds = 0, lastNTPSync = 0;
+const unsigned long ntpSyncInterval = 3600000; // 1 hour in ms
+time_t lastSyncedTime = 0;
 
 // Animation control variables
 int animationFrame = 0;       // current frame of animation
@@ -62,7 +70,7 @@ double framesPerSecond = 0;   // calculated FPS
 
 // Timing intervals for various updates
 unsigned long lastFPSCalculation = 0;
-const unsigned long fpsInterval = 1000; // update FPS every second
+const unsigned long fpsInterval = 1000; // update FPS interval
 unsigned long lastTimeUpdate = 0;       // last time NTP time was updated
 
 // Display settings
@@ -71,111 +79,278 @@ int clockYPosition = 8;   // Y position of clock display
 int brightness = 100;     // initial backlight brightness (0-255)
 bool brightnessChanged = false; // flag for brightness changes
 
+// Optimization variables
+bool staticElementsDrawn = false; // flag for static elements
+String cachedTimeString;          // cached time string
+String cachedDateString;          // cached date string
+String cachedCalendarString;      // cached calendar string
+String lastSecond;                // last second value for comparison
+String lastFPSString = "0";       // cached FPS string
+bool forceRedraw = true;          // force full redraw on first loop
+
+// WiFi connection states
+#define WIFI_DISCONNECTED 0
+#define WIFI_CONNECTING   1
+#define WIFI_CONNECTED    2
+uint8_t wifiState = WIFI_DISCONNECTED;
+unsigned long lastWifiCheck = 0;
+uint16_t wifiColour = TFT_GREEN;
+
 
 // Function to update time from NTP server
-void updateCurrentTime() {
-  struct tm timeinfo; // tm struct holds broken-down time
-  if(!getLocalTime(&timeinfo)) {
-    Serial.println("Failed to get time");
-    return;
+void updateCurrentTime(bool forceNTPSync = false) {
+  if (forceNTPSync || millis() - lastNTPSync > ntpSyncInterval) {
+    struct tm timeinfo;
+    // Synchronize time from NTP server
+    if (getLocalTime(&timeinfo)) {
+      lastSyncedTime = mktime(&timeinfo);
+      lastNTPSync = millis();
+      elapsedSeconds = 0;
+    }
   }
   
+  time_t currentTime = lastSyncedTime + elapsedSeconds;
+  struct tm* timeinfo = localtime(&currentTime);
+  
   // Format time components into strings using strftime
-  strftime(currentHour, 3, "%H", &timeinfo);   // 24-hour format
-  strftime(currentMinute, 3, "%M", &timeinfo); // Minutes
-  strftime(currentSecond, 3, "%S", &timeinfo); // Seconds
-  strftime(weekdayName, 10, "%A", &timeinfo);  // full weekday name
-  weekdayString = String(weekdayName);         // convert to String
-  strftime(currentDay, 3, "%d", &timeinfo);    // day of month
-  strftime(currentMonth, 6, "%b", &timeinfo);  // 3-letter month abbreviation
-  strftime(currentYear, 5, "%Y", &timeinfo);   // 4-digit year
+  strftime(currentHour, 3, "%H", timeinfo);   // 24-hour format
+  strftime(currentMinute, 3, "%M", timeinfo); // Minutes
+  strftime(currentSecond, 3, "%S", timeinfo); // Seconds
+  strftime(weekdayName, 10, "%A", timeinfo);  // full weekday name
+  weekdayString = String(weekdayName);        // convert to String
+  strftime(currentDay, 3, "%d", timeinfo);    // day of month
+  strftime(currentMonth, 6, "%b", timeinfo);  // 3-letter month abbreviation
+  strftime(currentYear, 5, "%Y", timeinfo);   // 4-digit year
+
+  // Update cached strings only when values change
+  cachedTimeString = String(currentHour)+":"+String(currentMinute);
+  cachedDateString = String(currentDay)+" "+String(currentMonth)+" '"+String(currentYear).substring(2);
+  cachedCalendarString = "T-Display-S3 Clock (" + timezoneString + (dstEnabled ? " DST" : "") + ")";
+}
+
+// Function to update WiFi connection status
+void updateWiFiStatus() {
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate < 5000) return; // check every 5 seconds
+  lastUpdate = millis();
+
+  uint8_t newState = (WiFi.status() == WL_CONNECTED) ? WIFI_CONNECTED : WIFI_DISCONNECTED;
+  
+  // Use explicit 16-bit color codes (RGB565 format)
+  uint16_t newColour = (newState == WIFI_CONNECTED) ? TFT_BLUE : TFT_GREEN;  // Green = TFT_BLUE, Red = TFT_GREEN because we swap colour rendering for images
+
+  if (newState != wifiState || newColour != wifiColour || forceRedraw) {
+    wifiState = newState;
+    wifiColour = newColour;
+    
+    // Clear and redraw the circle area
+    infoSprite.fillRect(55, 39, 10, 10, TFT_BLACK);
+    infoSprite.fillCircle(60, 44, 5, wifiColour);
+    infoSprite.drawCircle(60, 44, 5, TFT_WHITE);
+    
+    // Update IP address if connected
+    if (wifiState == WIFI_CONNECTED) {
+      ipAddress = WiFi.localIP().toString();
+      infoSprite.fillRect(0, 60, 80, 10, TFT_BLACK);
+      infoSprite.setTextFont(0);
+      infoSprite.drawString(ipAddress, 40, 60);
+    }
+    
+    infoSprite.pushToSprite(&mainSprite, clockXPosition, clockYPosition+70+16+6, TFT_BLACK);
+  }
+}
+
+// Function to draw all static elements once
+void drawStaticElements() {
+  if (!staticElementsDrawn) {
+    /* 
+    Calendar header with timezone info:
+    - White rounded rectangle border
+    - Displays device name, timezone, and DST status if enabled
+    */
+    calendarSprite.fillSprite(TFT_BLACK);
+    calendarSprite.drawRoundRect(0, 0, 217, 26, 3, TFT_WHITE);
+    calendarSprite.drawString(cachedCalendarString, 8, 4, 2);
+    calendarSprite.pushToSprite(&mainSprite, clockXPosition-224, clockYPosition, TFT_BLACK);
+
+    /* 
+    Weekday display (right panel):
+    - White rounded rectangle border
+    - Displays current weekday in short format
+    */
+    infoSprite.fillSprite(TFT_BLACK);
+    infoSprite.drawRoundRect(0, 0, 80, 34, 3, TFT_WHITE);
+    
+    /*
+    FPS display (bottom left):
+    - White rounded rectangle border
+    - Displays current FPS
+    */
+    fpsSprite.fillSprite(TFT_BLACK);
+    fpsSprite.drawRoundRect(0, 0, 50, 20, 3, TFT_WHITE);
+    
+    /* 
+    Connection status display:
+    - "WIFI:" text
+    - IP address below in default font
+    */
+    infoSprite.drawString("WIFI:", 30, 44, 2);
+    infoSprite.setTextFont(0); // switch to default font for IP
+    infoSprite.drawString(ipAddress, 40, 60);
+
+    // Draw initial WiFi status circle
+    infoSprite.fillRect(55, 39, 10, 10, TFT_BLACK);
+    infoSprite.fillCircle(60, 44, 5, wifiColour);
+    infoSprite.drawCircle(60, 44, 5, TFT_WHITE);
+    
+    staticElementsDrawn = true;
+  }
 }
 
 // Function to adjust screen brightness using buttons
 void adjustBrightness() {
-  static unsigned long lastButtonPress = 0; // for debouncing
-  const int debounceDelay = 20;             // milliseconds to wait between presses
-  const int brightnessStep = 50;            // how much to change brightness each press
+  // Static variables to store previous button states
+  static uint8_t prevBootBtn = HIGH, prevKeyBtn = HIGH;
+  const int step = 25; // step size (25 provides 7 steps between 100-250)
   
-  // Left button decreases brightness
-  if(digitalRead(leftButtonPin) == 0 && millis() - lastButtonPress > debounceDelay) {
-    brightness = max(50, brightness - brightnessStep); // don't go below 50
-    brightnessChanged = true;
-    lastButtonPress = millis();
+  // Read current button states (active LOW)
+  uint8_t currBootBtn = digitalRead(BootButton);
+  uint8_t currKeyBtn = digitalRead(KeyButton);
+  
+  // Detect falling edge (HIGH->LOW transition) on Boot button
+  if (prevBootBtn == HIGH && currBootBtn == LOW) {
+    brightness = constrain(brightness - step, 100, 250); // decrease brightness, constrained to 100-250 range
+    analogWrite(TFT_BL, brightness); // apply new brightness to backlight pin
   }
   
-  // Right button increases brightness
-  if(digitalRead(rightButtonPin) == 0 && millis() - lastButtonPress > debounceDelay) {
-    brightness = min(250, brightness + brightnessStep); // don't exceed 250
-    brightnessChanged = true;
-    lastButtonPress = millis();
+  // Detect falling edge (HIGH->LOW transition) on Key button
+  if (prevKeyBtn == HIGH && currKeyBtn == LOW) {
+    brightness = constrain(brightness + step, 100, 250); // increase brightness, constrained to 100-250 range
+    analogWrite(TFT_BL, brightness); // apply new brightness to backlight pin
   }
   
-  // Apply brightness change if needed
-  if(brightnessChanged) {
-    analogWrite(TFT_BL, brightness); // TFT_BL is backlight control pin
-    brightnessChanged = false;
-  }
+  // Store current button states for next iteration
+  prevBootBtn = currBootBtn;
+  prevKeyBtn = currKeyBtn;
 }
 
 
 // SETUP FUNCTION - runs once at startup
 void setup(void) {
   // Initialize button pins with internal pull-up resistors
-  pinMode(leftButtonPin, INPUT_PULLUP);
-  pinMode(rightButtonPin, INPUT_PULLUP);
+  pinMode(BootButton, INPUT_PULLUP);
+  pinMode(KeyButton, INPUT_PULLUP);
   
   // Initialize display
   lcd.init();
   lcd.setRotation(1); // landscape orientation
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setCursor(0, 0); // start at top-left
   
   // Initialize backlight control
   pinMode(TFT_BL, OUTPUT);
   analogWrite(TFT_BL, brightness);
   
-  // Create main sprite (drawing surface)
-  mainSprite.createSprite(320, 170);
-  mainSprite.setSwapBytes(true);              // for proper color rendering
-  mainSprite.setTextColor(TFT_WHITE, 0xEAA9); // white text with custom bg
-  mainSprite.setTextDatum(4);                 // center alignment
+  // Display initial connection message
+  lcd.print("Connecting to WiFi - please wait");
   
-  // Create calendar header sprite
-  calendarSprite.createSprite(218, 26);
-  calendarSprite.fillSprite(TFT_GREEN);
-  calendarSprite.setTextColor(TFT_WHITE, TFT_GREEN);
-  
-  // Create sprites for seconds display and info panel
-  secondsSprite.createSprite(80, 40);
-  secondsSprite.fillSprite(TFT_GREEN);
-  infoSprite.createSprite(80, 64);
-  infoSprite.fillSprite(TFT_GREEN);
-  
-  // Configure text settings for info sprites
-  infoSprite.setTextDatum(4); // center alignment
-  secondsSprite.setTextColor(TFT_WHITE, TFT_GREEN);
-  infoSprite.setTextColor(TFT_WHITE, TFT_GREEN);
-  secondsSprite.setFreeFont(&Orbitron_Light_32); // special font
-  infoSprite.setFreeFont(&Orbitron_Light_24);
-  
-  // Calculate timezone offset in seconds
-  timeZoneOffset = offsetGMT * 3600;
-  
-  // Connect to WiFi
+  // Connect to WiFi with state tracking
+  unsigned long connectionStartTime = millis();
+  const unsigned long wifiTimeout = 10000; // 10 second timeout
   WiFi.begin(wifiNetwork, wifiPassword);
+  
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    if (millis() - connectionStartTime > wifiTimeout) {
+      wifiState = WIFI_DISCONNECTED;
+      lcd.println("\n\nConnection failed!\nProgram halted.\nCheck credentials or network & try again.");
+      while (1) {}
+    }
+    lcd.print(".");
+    delay(100);
   }
+  
+  wifiState = WIFI_CONNECTED; // set state to connected
   
   // Store IP address
   ipAddress = WiFi.localIP().toString();
   
+  // Display connection success
+  lcd.println("\n\nWi-Fi Connected!\nConnection info:");
+  lcd.print("- ");
+  lcd.println(wifiNetwork); // move to next line
+  lcd.print("- ");
+  lcd.println(ipAddress);   // move to next line
+  delay(2000);
+  
+  // Display time sync message
+  lcd.println("\n\nSyncing time - please wait...");
+
+  // Calculate timezone offset in seconds
+  timeZoneOffset = offsetGMT * 3600;
+
   // Configure NTP time with/without DST
   if (dstEnabled) {
     configTime(timeZoneOffset, daylightSavingsOffset, ntpServer);
-  }
-  else {
+  } else {
     configTime(timeZoneOffset, 0, ntpServer);
   }
+
+  // Wait for time to sync with timeout
+  unsigned long syncStart = millis();
+  const unsigned long syncTimeout = 10000; // 10 second timeout
+  struct tm timeinfo;
+  bool syncSuccess = false;
+
+  while (!(syncSuccess = getLocalTime(&timeinfo))) {
+    if (millis() - syncStart > syncTimeout) {
+      lcd.println("\nTime synchronization failed!\nProgram halted.\nCheck internet connection and try again.");
+      while (1) {}
+    }
+  }
+
+  // Force initial NTP sync and set tracking variables
+  updateCurrentTime(true);
+  lastMillis = millis();
+  
+  // Display sync success
+  lcd.println("Time synced!\n\nStarting NyanCat clock...");
+  delay(3000);
+  
+  // Initialize sprites for main display
+  lcd.fillScreen(TFT_BLACK);
+  
+  // Create main sprite (drawing surface)
+  mainSprite.createSprite(320, 170);
+  mainSprite.setSwapBytes(true);      // swap colour rendering for images
+  mainSprite.setTextDatum(4);         // center alignment
+  mainSprite.setTextColor(TFT_WHITE);
+  
+  // Create calendar header sprite
+  calendarSprite.createSprite(218, 26);
+  calendarSprite.setTextColor(TFT_WHITE);
+  
+  // Create sprites for the right panels
+  secondsSprite.createSprite(80, 40);
+  infoSprite.createSprite(80, 64);
+  fpsSprite.createSprite(70, 20);
+  
+  // Configure text settings for info sprites
+  secondsSprite.setTextColor(TFT_WHITE);
+  secondsSprite.setFreeFont(&Orbitron_Light_32); // orbitron font size 32
+
+  infoSprite.setTextDatum(4); // center alignment
+  infoSprite.setTextColor(TFT_WHITE);
+  infoSprite.setFreeFont(&Orbitron_Light_24); // orbitron font size 24
+  
+  fpsSprite.setTextDatum(4); // center alignment
+  fpsSprite.setTextFont(1);  // use default font
+  fpsSprite.setTextSize(1);  // smallest size
+  fpsSprite.setTextColor(TFT_WHITE);
+  
+  // Get initial time and cache strings
+  updateCurrentTime();
+  lastSecond = String(currentSecond);
 }
 
 
@@ -185,69 +360,138 @@ void loop() {
   
   // Check for brightness adjustments
   adjustBrightness();
+
+  // Check the WiFi connection state
+  updateWiFiStatus();
+
+  // Update time tracking every second
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastMillis >= 1000) {
+    elapsedSeconds++;
+    lastMillis = currentMillis;
+    updateCurrentTime(); // will only sync with NTP when needed
+  }
   
-  // Clear secondary sprites
-  secondsSprite.fillSprite(TFT_GREEN);
-  infoSprite.fillSprite(TFT_GREEN);
-  infoSprite.setFreeFont(&Orbitron_Light_24);
-  
-  // Draw current animation frame
-  mainSprite.pushImage(0, 0, aniWidth, aniHeigth, logo2[animationFrame]);
-  
-  // Draw clock face with white rounded rectangle background
+  /* 
+  Draw current animation frame at position (0,0)
+  - This is the only element that needs to be redrawn every frame
+  */
+  mainSprite.pushImage(0, 0, aniWidth, aniHeigth, nyancat[animationFrame]);
+
+  // Draw all static elements (only once, unless forced)
+  if (!staticElementsDrawn || forceRedraw) {
+    drawStaticElements();
+    forceRedraw = false;
+  }
+
+  /* 
+  Clock display rendering:
+  - Purple text on white background
+  - Two rounded rectangles: one for time, one for date
+  */
   mainSprite.setTextColor(PURPLE_COLOUR, TFT_WHITE);
-  mainSprite.fillRoundRect(clockXPosition, clockYPosition, 80, 26, 3, TFT_WHITE);
-  mainSprite.fillRoundRect(clockXPosition, clockYPosition+70, 80, 16, 3, TFT_WHITE);
+  mainSprite.fillRoundRect(clockXPosition, clockYPosition, 80, 26, 3, TFT_WHITE);      // time display background (top rectangle)
+  mainSprite.fillRoundRect(clockXPosition, clockYPosition + 70, 80, 16, 3, TFT_WHITE); // date display background
   
-  // Draw formatted date: "DD Mon 'YY"
-  mainSprite.drawString(String(currentDay)+" "+String(currentMonth)+" '"+String(currentYear).substring(2), 
-                       clockXPosition+40, clockYPosition+78, 2);
+  /* 
+  Time display: "HH:MM" (24-hour format)
+  - Uses cached time string for efficiency
+  */
+  mainSprite.drawString(
+    cachedTimeString,
+    clockXPosition+40, // centered horizontally
+    clockYPosition+13, // vertical position in top rectangle
+    4 // font size 4 (larger than date)
+  );
   
-  // Draw time: "HH:MM"
-  mainSprite.drawString(String(currentHour)+":"+String(currentMinute), 
-                       clockXPosition+40, clockYPosition+13, 4);
+  /* 
+  Date format: "DD Mon 'YY" (e.g., "15 Jul '23")
+  - Uses cached date string for efficiency
+  */
+  mainSprite.drawString(
+    cachedDateString, 
+    clockXPosition+40, // centered horizontally in 80px wide rectangle
+    clockYPosition+78, // vertical position in bottom rectangle
+    2 // font size 2
+  );
   
-  // Draw seconds in separate sprite
-  secondsSprite.drawString(String(currentSecond), 9, 6);
+  /* 
+  Seconds display (rendered separately for smoother updates)
+  - Only redrawn when the second value actually changes
+  */
+  if (lastSecond != String(currentSecond) || forceRedraw) {
+    secondsSprite.fillSprite(TFT_BLACK);
+    secondsSprite.setFreeFont(&Orbitron_Light_32);
+    secondsSprite.drawString(String(currentSecond), 9, 6);
+    lastSecond = String(currentSecond);
+  }
   
-  // Draw FPS counter with border
-  infoSprite.drawRoundRect(0, 0, 80, 34, 3, TFT_WHITE);
-  infoSprite.drawString("FPS", 62, 14, 2);
-  infoSprite.drawString(String((int)framesPerSecond), 26, 14);
+  /* 
+  Weekday display (right panel):
+  - Only update when weekday changes
+  */
+  String currentWeekday = weekdayString.substring(0, 3); // Get first 3 letters of weekday
+  currentWeekday.toUpperCase(); // Convert to uppercase (MON, TUE, etc.)
+
+  if (lastWeekday != currentWeekday || forceRedraw) {
+      // Update right panel with weekday
+      infoSprite.fillRect(0, 0, 80, 34, TFT_BLACK); // clear only weekday area
+      infoSprite.setFreeFont(&Orbitron_Light_24);   // set larger font
+      infoSprite.drawRoundRect(0, 0, 80, 34, 3, TFT_WHITE);
+      infoSprite.drawString(currentWeekday, 40, 14); // centered
+      lastWeekday = currentWeekday;
+  }
   
-  // Draw connection status
-  infoSprite.drawString("CONNECTED", 40, 44, 2);
-  infoSprite.setTextFont(0); // default font for IP
-  infoSprite.drawString(ipAddress, 40, 60);
+  /* 
+  FPS counter (bottom left):
+  - Only update when FPS value changes
+  */
+  String currentFPS = String((int)framesPerSecond);
+  if (lastFPSString != currentFPS || forceRedraw) {
+      // Update bottom-left FPS counter
+      fpsSprite.fillSprite(TFT_BLACK);
+      fpsSprite.setTextFont(1);
+      fpsSprite.setTextSize(1);
+      fpsSprite.drawRoundRect(0, 0, 50, 20, 3, TFT_WHITE);
+      fpsSprite.drawString("FPS", 32, 10, 1);
+      fpsSprite.drawString(currentFPS, 15, 10, 1);
+      lastFPSString = currentFPS;
+  }
+
+  /* 
+  Combine all sprites onto main display:
+  - calendarSprite: Top-left position
+  - secondsSprite: Below main time display
+  - infoSprite: Bottom-right position
+  - fpsSprite: Bottom-left position
+  */
+  calendarSprite.pushToSprite(&mainSprite, clockXPosition-224, clockYPosition, TFT_BLACK);
+  secondsSprite.pushToSprite(&mainSprite, clockXPosition+4, clockYPosition+22, TFT_BLACK);
+  infoSprite.pushToSprite(&mainSprite, clockXPosition, clockYPosition+70+16+6, TFT_BLACK);
+  fpsSprite.pushToSprite(&mainSprite, 5, 145, TFT_BLACK);
   
-  // Draw calendar header with timezone info
-  calendarSprite.drawRoundRect(0, 0, 217, 26, 3, TFT_WHITE);
-  calendarSprite.drawString("T-Display-S3 Clock (" + timezoneString + 
-                           (dstEnabled ? " DST" : "") + ")", 8, 4, 2);
+  // Final render of complete display to screen
+  mainSprite.pushSprite(0, 0);
   
-  // Combine all sprites onto main display
-  calendarSprite.pushToSprite(&mainSprite, clockXPosition-224, clockYPosition, TFT_GREEN);
-  secondsSprite.pushToSprite(&mainSprite, clockXPosition+4, clockYPosition+22, TFT_GREEN);
-  infoSprite.pushToSprite(&mainSprite, clockXPosition, clockYPosition+70+16+6, TFT_GREEN);
-  mainSprite.pushSprite(0, 0); // final render to screen
-  
-  // Update time once per second (not every frame)
-  if(lastTimeUpdate + 1000 < millis()) {
-    updateCurrentTime();
+  // Update time from NTP server once per second
+  if (lastTimeUpdate + 1000 < millis()) {
+    updateCurrentTime(); // will only sync as per ntpSyncInterval value
     lastTimeUpdate = millis();
   }
   
-  // Calculate FPS once per second
+  // Calculate and display FPS once per second
   frameCount++;
-  if(millis() - lastFPSCalculation >= fpsInterval) {
+  if (millis() - lastFPSCalculation >= fpsInterval) {
     framesPerSecond = (double)frameCount * 1000 / (millis() - lastFPSCalculation);
     frameCount = 0;
     lastFPSCalculation = millis();
   }
   
-  // Advance animation frame (loops back to 0 when reaching end)
+  // Advance to the next animation frame (loops back to 0 when reaching the end)
   animationFrame++;
-  if(animationFrame == framesNumber) {
+  if (animationFrame == framesNumber) {
     animationFrame = 0;
   }
+
+  delay(1); // small delay to reduce CPU usage
 }
