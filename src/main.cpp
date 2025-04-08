@@ -41,9 +41,9 @@ Time configuration:
  - dstEnabled: Daylight Savings Time flag
 */
 const char* ntpServer = "pool.ntp.org";
-int offsetGMT = 2;       // GMT+(your offset)
-bool dstEnabled = false; // set to true if you use Daylight Savings Time
-long timeZoneOffset;     // calculated timezone offset
+int offsetGMT = 2;                // GMT+(your offset)
+bool dstEnabled = false;          // set to true if you use Daylight Savings Time
+long timeZoneOffset;              // calculated timezone offset
 int daylightSavingsOffset = 3600; // DST offset in seconds (1 hour)
 String timezoneString = "SAST";   // timezone abbreviation, change to your timezone code
 
@@ -63,7 +63,7 @@ String lastWeekday;    // cached weekday string
 
 // Time tracking variables
 unsigned long lastMillis = 0, elapsedSeconds = 0, lastNTPSync = 0;
-const unsigned long ntpSyncInterval = 3600000; // 1 hour in ms
+const unsigned long ntpSyncInterval = 600000; // sync every 10min
 time_t lastSyncedTime = 0;
 
 // Animation control variables
@@ -74,13 +74,14 @@ double framesPerSecond = 0;   // calculated FPS
 
 // Timing intervals for various updates
 unsigned long lastFPSCalculation = 0;
+unsigned long wifiFailedTime = 0;       // track when failure occurred
 const unsigned long fpsInterval = 1000; // update FPS interval
 unsigned long lastTimeUpdate = 0;       // last time NTP time was updated
 
 // Display settings
-int clockXPosition = 231; // X position of clock display
-int clockYPosition = 8;   // Y position of clock display
-int brightness = 100;     // initial backlight brightness (0-255)
+int clockXPosition = 231;       // X position of clock display
+int clockYPosition = 8;         // Y position of clock display
+int brightness = 100;           // initial backlight brightness (0-255)
 bool brightnessChanged = false; // flag for brightness changes
 
 // Optimization variables
@@ -93,11 +94,24 @@ String lastFPSString = "0";       // cached FPS string
 bool forceRedraw = true;          // force full redraw on first loop
 
 // WiFi connection states
-#define WIFI_DISCONNECTED 0
-#define WIFI_CONNECTING   1
-#define WIFI_CONNECTED    2
-uint8_t wifiState = WIFI_DISCONNECTED;
+typedef enum {
+  WIFI_STATE_DISCONNECTED, // not connected, idle
+  WIFI_STATE_CONNECTING,   // attempting to connect
+  WIFI_STATE_CONNECTED,    // successfully connected
+  WIFI_STATE_RECONNECTING, // lost connection, trying to reconnect
+  WIFI_STATE_FAILED        // connection failed (after max retries)
+} wifi_state_t;
+
+// WiFi connection parameters
+const unsigned long WIFI_CHECK_INTERVAL = 5000;   // 5 seconds between checks
+const unsigned long WIFI_CONNECT_TIMEOUT = 10000; // 10 second connection timeout
+const uint8_t MAX_RECONNECT_ATTEMPTS = 3;         // max retries before giving up
+
+// WiFi state variables
+wifi_state_t wifiState = WIFI_STATE_DISCONNECTED;
 unsigned long lastWifiCheck = 0;
+unsigned long wifiConnectStart = 0;
+uint8_t reconnectAttempts = 0;
 uint16_t wifiColour = TFT_GREEN;
 
 
@@ -131,40 +145,160 @@ void updateCurrentTime(bool forceNTPSync = false) {
   strftime(currentYear, 5, "%Y", timeinfo);   // 4-digit year
 
   // Update cached strings only when values change
-  cachedTimeString = String(currentHour)+":"+String(currentMinute);
-  cachedDateString = String(currentDay)+" "+String(currentMonth)+" '"+String(currentYear).substring(2);
+  cachedTimeString = String(currentHour) + ":" + String(currentMinute);
+  cachedDateString = String(currentDay) + " " + String(currentMonth) + " '" + String(currentYear).substring(2);
   cachedCalendarString = "T-Display-S3 Clock (" + timezoneString + (dstEnabled ? " DST" : "") + ")";
+}
+
+// Function to handle WiFi events
+void WiFiEvent(WiFiEvent_t event) {
+  switch(event) {
+    case SYSTEM_EVENT_STA_CONNECTED:
+      break;
+    
+    case SYSTEM_EVENT_STA_GOT_IP:
+      if (wifiState == WIFI_STATE_CONNECTING || wifiState == WIFI_STATE_RECONNECTING) {
+        wifiState = WIFI_STATE_CONNECTED;
+        ipAddress = WiFi.localIP().toString();
+        reconnectAttempts = 0;
+        lastNTPSync = 0; // force NTP sync on reconnection
+        forceRedraw = true;
+      }
+      break;
+    
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+      if (wifiState == WIFI_STATE_CONNECTED) {
+        wifiState = WIFI_STATE_RECONNECTING;
+        wifiConnectStart = millis();
+        forceRedraw = true;
+      }
+      break;
+    
+    default:
+      break;
+  }
+}
+
+// Function to start WiFi connection
+void startWiFi() {
+  WiFi.disconnect(true);  // true = disable auto-reconnect
+  delay(100); // short delay to allow WiFi to disconnect
+  WiFi.begin(wifiNetwork, wifiPassword);
+  wifiState = WIFI_STATE_CONNECTING;
+  wifiConnectStart = millis();
+  reconnectAttempts = 0;
+}
+
+// Function to handle WiFi connection timeout
+void WiFiTimeout() {
+  // Attempt to reconnect
+  if (wifiState == WIFI_STATE_RECONNECTING && ++reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    wifiState = WIFI_STATE_FAILED;
+    wifiFailedTime = millis();
+  } else {
+    // Try again if connection is lost/fails
+    WiFi.disconnect(true); // true = disable auto-reconnect
+    delay(100); // short delay to allow WiFi to disconnect
+    WiFi.begin(wifiNetwork, wifiPassword); // start reconnection
+    wifiConnectStart = millis();
+    wifiState = WIFI_STATE_RECONNECTING;
+  }
+}
+
+// Function to try WiFi recovery if needed
+void WiFiRecovery(unsigned long currentMillis) {
+  // Attempt recovery after 2 minutes
+  if (currentMillis - wifiFailedTime > 120000) { // 2 minutes
+    wifiState = WIFI_STATE_DISCONNECTED;
+  }
 }
 
 // Function to update WiFi connection status
 void updateWiFiStatus() {
-  static unsigned long lastUpdate = 0;
-  if (millis() - lastUpdate < 5000) return; // check every 5 seconds
-  lastUpdate = millis();
-
-  uint8_t newState = (WiFi.status() == WL_CONNECTED) ? WIFI_CONNECTED : WIFI_DISCONNECTED;
+  unsigned long currentMillis = millis();
   
-  // Use explicit 16-bit color codes (RGB565 format)
-  uint16_t newColour = (newState == WIFI_CONNECTED) ? TFT_BLUE : TFT_GREEN;  // Green = TFT_BLUE, Red = TFT_GREEN because we swap colour rendering for images
+  // Manage connection attempts periodically
+  if (currentMillis - lastWifiCheck < WIFI_CHECK_INTERVAL) {
+    return;
+  }
+  lastWifiCheck = currentMillis;
+  
+  switch (wifiState) {
+    case WIFI_STATE_DISCONNECTED:
+      startWiFi();
+      break;
+      
+    case WIFI_STATE_CONNECTING:
+    case WIFI_STATE_RECONNECTING:
+      if (currentMillis - wifiConnectStart > WIFI_CONNECT_TIMEOUT) {
+        WiFiTimeout();
+      }
+      break;
+      
+    case WIFI_STATE_FAILED:
+      WiFiRecovery(currentMillis);
+      break;
+      
+    case WIFI_STATE_CONNECTED:
+      // Verify IP address is still valid
+      if (ipAddress != WiFi.localIP().toString()) {
+        ipAddress = WiFi.localIP().toString();
+        forceRedraw = true;
+      }
+      break;
+  }
 
-  if (newState != wifiState || newColour != wifiColour || forceRedraw) {
-    wifiState = newState;
+  // Update visual indicator based on state (colour swapped circle colours)
+  uint16_t newColour;
+  switch (wifiState) {
+    case WIFI_STATE_CONNECTED:
+      newColour = 0x001F; // swapped green
+      break;
+    case WIFI_STATE_CONNECTING:
+    case WIFI_STATE_RECONNECTING:
+      newColour = 0x07FF; // swapped yellow
+      break;
+    case WIFI_STATE_FAILED:
+      newColour = 0x07E0; // swapped red
+      break;
+    default:
+      newColour = 0x001F; // swapped green
+  }
+
+  // Always redraw the status area when state changes or forced
+  if (newColour != wifiColour || forceRedraw) {
     wifiColour = newColour;
+
+    // Clear the entire status area (both circle and text)
+    infoSprite.fillRect(0, 39, 80, 35, TFT_BLACK);
     
-    // Clear and redraw the circle area
-    infoSprite.fillRect(55, 39, 10, 10, TFT_BLACK);
+    // Redraw the static "WIFI:" label
+    infoSprite.setTextFont(0);
+    infoSprite.setTextDatum(4); // center alignment
+    infoSprite.drawString("WIFI:", 30, 44, 2);
+    
+    // Redraw the status circle
     infoSprite.fillCircle(60, 44, 5, wifiColour);
     infoSprite.drawCircle(60, 44, 5, TFT_WHITE);
     
-    // Update IP address if connected
-    if (wifiState == WIFI_CONNECTED) {
-      ipAddress = WiFi.localIP().toString();
-      infoSprite.fillRect(0, 60, 80, 10, TFT_BLACK);
-      infoSprite.setTextFont(0);
-      infoSprite.drawString(ipAddress, 40, 60);
-    }
+    // Clear and redraw the status text area with proper alignment
+    infoSprite.fillRect(0, 60, 100, 10, TFT_BLACK);
+    infoSprite.setTextFont(0);
+    infoSprite.setTextDatum(4); // center alignment
     
-    infoSprite.pushToSprite(&mainSprite, clockXPosition, clockYPosition+70+16+6, TFT_BLACK);
+    if (wifiState == WIFI_STATE_CONNECTED) {
+      infoSprite.drawString(ipAddress, 43, 60, 1); // was 40, 60, 1
+    } else {
+      const char* statusText = "";
+      switch(wifiState) {
+        case WIFI_STATE_CONNECTING: statusText = "CONNECTING"; break;
+        case WIFI_STATE_RECONNECTING: statusText = "RECONNECTING"; break;
+        case WIFI_STATE_FAILED: statusText = "FAILED"; break;
+        default: statusText = "OFFLINE"; break;
+      }
+      infoSprite.drawString(statusText, 43, 60, 1); // was 40, 60, 1
+    }
+    forceRedraw = false;
   }
 }
 
@@ -203,8 +337,7 @@ void drawStaticElements() {
     - IP address below in default font
     */
     infoSprite.drawString("WIFI:", 30, 44, 2);
-    infoSprite.setTextFont(0); // switch to default font for IP
-    infoSprite.drawString(ipAddress, 40, 60);
+    infoSprite.setTextFont(0);
 
     // Draw initial WiFi status circle
     infoSprite.fillRect(55, 39, 10, 10, TFT_BLACK);
@@ -263,26 +396,35 @@ void setup(void) {
   // Initialize backlight control
   pinMode(TFT_BL, OUTPUT);
   analogWrite(TFT_BL, brightness);
+
+  // Register WiFi event handler before connecting
+  WiFi.onEvent(WiFiEvent);
   
   // Display initial connection message
   lcd.print("Connecting to WiFi - please wait");
   
-  // Connect to WiFi with state tracking
-  unsigned long connectionStartTime = millis();
-  const unsigned long wifiTimeout = 10000; // 10 second timeout
-  WiFi.begin(wifiNetwork, wifiPassword);
+  // Initialize WiFi connection
+  wifiState = WIFI_STATE_DISCONNECTED; // will transition to CONNECTING in first update
+  startWiFi();
   
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - connectionStartTime > wifiTimeout) {
-      wifiState = WIFI_DISCONNECTED;
-      lcd.println("\n\nConnection failed!\nProgram halted.\nCheck credentials or network & try again.");
+  // Wait for initial connection with timeout
+  unsigned long connectionStartTime = millis();
+  while (wifiState != WIFI_STATE_CONNECTED) {
+    updateWiFiStatus(); // WiFi state machine
+    
+    if (millis() - connectionStartTime > WIFI_CONNECT_TIMEOUT * 2) {
+      if (wifiState == WIFI_STATE_FAILED) {
+        lcd.println("\n\nConnection failed after multiple attempts!");
+      } else {
+        lcd.println("\n\nConnection timeout!");
+      }
+      lcd.println("Program halted.\nCheck credentials or network & try again.");
       while (1) {}
     }
+    
     lcd.print(".");
     delay(100);
   }
-  
-  wifiState = WIFI_CONNECTED; // set state to connected
   
   // Store IP address
   ipAddress = WiFi.localIP().toString();
@@ -344,7 +486,7 @@ void setup(void) {
   
   // Create sprites for the right panels
   secondsSprite.createSprite(80, 40);
-  infoSprite.createSprite(80, 64);
+  infoSprite.createSprite(100, 64);
   fpsSprite.createSprite(70, 20);
   
   // Configure text settings for info sprites
@@ -363,12 +505,30 @@ void setup(void) {
   // Get initial time and cache strings
   updateCurrentTime();
   lastSecond = String(currentSecond);
+  
+  // Clear any existing display artifacts
+  lcd.fillScreen(TFT_BLACK);
+  mainSprite.fillSprite(TFT_BLACK);
+  
+  // Draw static elements immediately
+  drawStaticElements();
+  
+  // Push initial state to display
+  mainSprite.pushSprite(0, 0);
 }
 
 
 // MAIN LOOP - runs continuously
 void loop() {
+  static bool firstLoop = true;
   frameStartTime = millis(); // record frame start time for FPS calculation
+
+  // Force update on first loop iteration
+  if (firstLoop) {
+    forceRedraw = true;
+    updateWiFiStatus();
+    firstLoop = false;
+  }
   
   // Check for brightness adjustments
   adjustBrightness();
@@ -413,7 +573,7 @@ void loop() {
     cachedTimeString,
     clockXPosition+40, // centered horizontally
     clockYPosition+13, // vertical position in top rectangle
-    4 // font size 4 (larger than date)
+    4 // font size 4
   );
   
   /* 
@@ -442,15 +602,15 @@ void loop() {
   Weekday display (right panel):
   - Only update when weekday changes
   */
-  String currentWeekday = weekdayString.substring(0, 3); // Get first 3 letters of weekday
-  currentWeekday.toUpperCase(); // Convert to uppercase (MON, TUE, etc.)
+  String currentWeekday = weekdayString.substring(0, 3); // get first 3 letters of weekday
+  currentWeekday.toUpperCase(); // convert to uppercase (MON, TUE, etc.)
 
   if (lastWeekday != currentWeekday || forceRedraw) {
       // Update right panel with weekday
       infoSprite.fillRect(0, 0, 80, 34, TFT_BLACK); // clear only weekday area
       infoSprite.setFreeFont(&Orbitron_Light_24);   // set larger font
       infoSprite.drawRoundRect(0, 0, 80, 34, 3, TFT_WHITE);
-      infoSprite.drawString(currentWeekday, 40, 14); // centered
+      infoSprite.drawString(currentWeekday, 38, 14); // centered (was 40, 14)
       lastWeekday = currentWeekday;
   }
   
@@ -486,7 +646,7 @@ void loop() {
   mainSprite.pushSprite(0, 0);
   
   // Update time from NTP server once per second
-  if (lastTimeUpdate + 1000 < millis()) {
+  if (millis() - lastTimeUpdate >= 1000) {
     updateCurrentTime(); // will only sync as per ntpSyncInterval value
     lastTimeUpdate = millis();
   }
