@@ -13,7 +13,8 @@ An animated clock for the LilyGO T-Display-S3 featuring:
 - Animated Nyan Cat display
 - Hardware button brightness control
 - WiFi connection status with IP display
-- FPS counter for performance monitoring
+- WiFi reconnection if connection is lost
+- FPS counter
 - Date and weekday display
 - Configurable timezone support
 
@@ -32,3 +33,7 @@ An animated clock for the LilyGO T-Display-S3 featuring:
   - comment out line 27 (#include <User_Setup.h>) and,
   - uncomment line 133 (#include <User_Setups/Setup206_LilyGo_T_Display_S3.h>)
 - Only once the User_Setup_Select.h has been modified should the code be uploaded to the T-Display-S3.
+
+## Credits
+
+This project is inspired by [Volos Projects - NewTTGOAnalogReadings](https://github.com/VolosR/NewTTGOAnalogReadings)
