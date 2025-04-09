@@ -36,4 +36,4 @@ An animated clock for the LilyGO T-Display-S3 featuring:
 
 ## Credits
 
-This project is inspired by [Volos Projects - nyanCatTTGO](https://github.com/VolosR/nyanCatTTGO))
+This project is inspired by [Volos Projects - nyanCatTTGO](https://github.com/VolosR/nyanCatTTGO)
